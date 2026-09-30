@@ -8,6 +8,7 @@ import { buildDroppedOutputLine, trimToBudget } from "../../shared/line-buffer";
 import {
   CHANNELS,
   type CommandPinPayload,
+  type ProcessesEndedPayload,
   type ProcessesOutputChangedPayload,
   type ProcessProtocolNotificationPayload,
 } from "../../shared/protocol";
@@ -63,6 +64,11 @@ export function setupDockWidgets(
   let processLogStream: Array<{ processId: string; line: ProcessLogLine }> = [];
   let pinnedConnection: LogsConnection | null = null;
   let pinnedConnectionId: string | null = null;
+  // Ids of failed/killed processes still rendered individually in the status
+  // widget. A failure stays visible by name until the next process starts,
+  // then folds into the `! N failed` / `■ N killed` summary tokens.
+  const pendingTerminalIds = new Set<string>();
+
   let hasSeenRunningProcess = false;
   let pendingRefresh: NodeJS.Timeout | null = null;
   let pendingRender: NodeJS.Timeout | null = null;
@@ -148,7 +154,8 @@ export function setupDockWidgets(
     ctx.ui.setWidget(
       STATUS_WIDGET_KEY,
       (_tui, theme: Theme) => ({
-        render: (width: number) => renderStatusWidget(processes, theme, width),
+        render: (width: number) =>
+          renderStatusWidget(processes, theme, width, pendingTerminalIds),
         invalidate: () => undefined,
       }),
       { placement: "belowEditor" },
@@ -164,6 +171,9 @@ export function setupDockWidgets(
     }
     for (const id of notifyMarkers.keys()) {
       if (!liveIds.has(id)) notifyMarkers.delete(id);
+    }
+    for (const id of pendingTerminalIds) {
+      if (!liveIds.has(id)) pendingTerminalIds.delete(id);
     }
     if (processes.some((process) => process.status === "running")) {
       hasSeenRunningProcess = true;
@@ -344,11 +354,24 @@ export function setupDockWidgets(
     // Set synchronously so a process that exits within the scheduleRefresh
     // throttle window still counts as "seen running" for auto-close.
     hasSeenRunningProcess = true;
+    // A new process folds every previous failure into the status summaries.
+    pendingTerminalIds.clear();
     if (config.widget.dockDefaultState === "expanded") state.actions.expand();
     else if (config.widget.dockDefaultState === "collapsed") {
       state.actions.collapse();
     }
     scheduleRefresh();
+  };
+
+  const handleEnded = (rawPayload: unknown) => {
+    const process = rawPayload as ProcessesEndedPayload;
+    if (isTerminalFailure(process)) pendingTerminalIds.add(process.id);
+    scheduleRefresh();
+  };
+
+  const isTerminalFailure = (process: ProcessInfo): boolean => {
+    if (LIVE_STATUSES.has(process.status)) return false;
+    return !(process.status === "exited" && process.success);
   };
 
   const handleOutputChanged = (rawPayload: unknown) => {
@@ -416,7 +439,7 @@ export function setupDockWidgets(
   };
 
   disposers.push(events.on(CHANNELS.STARTED, handleStarted));
-  disposers.push(events.on(CHANNELS.ENDED, scheduleRefresh));
+  disposers.push(events.on(CHANNELS.ENDED, handleEnded));
   disposers.push(events.on(CHANNELS.CHANGED, scheduleRefresh));
   disposers.push(events.on(CHANNELS.OUTPUT_CHANGED, handleOutputChanged));
   disposers.push(
