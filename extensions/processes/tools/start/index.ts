@@ -9,6 +9,7 @@ import type {
 import { normalizeNotifyConfig } from "../notify";
 import type { ProcessesParamsType } from "../schema";
 import { formatMatcherForModel } from "../watch-format";
+import { buildSessionEnv } from "./session-env";
 
 export interface StartDetails {
   action: "start";
@@ -33,7 +34,12 @@ export function executeStart(
   const notify = normalizeNotifyConfig(params.notify);
 
   const cwd = params.cwd ?? ctx.cwd;
-  const process = manager.start(params.name, params.command, cwd);
+  const process = manager.start(
+    params.name,
+    params.command,
+    cwd,
+    buildSessionEnv(ctx),
+  );
   notifications.register(process.id, notify);
 
   return {
