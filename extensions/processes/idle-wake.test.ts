@@ -129,20 +129,119 @@ describe("createTurnNotificationDelivery", () => {
       expect(t.sendUserMessage).toHaveBeenCalledTimes(2);
     });
 
-    it("does not wake while a user prompt is starting, until its window expires", async () => {
+    it("wakes once after the input window expires when that input never starts a run", async () => {
       const t = setup();
       t.emit("session_start");
       t.emit("input", { source: "interactive" });
 
       t.delivery.deliver(details);
-      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(1_999);
       expect(t.sendUserMessage).not.toHaveBeenCalled();
       expect(t.optionsOf()).toEqual([NEXT_TURN]);
 
-      vi.advanceTimersByTime(2_001);
+      await vi.advanceTimersByTimeAsync(2);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("sends no wake after expiry when a prompt reached before_agent_start and carried the notification", async () => {
+      const t = setup();
+      t.emit("session_start");
+      t.emit("input", { source: "interactive" });
+      t.delivery.deliver(details);
+
+      t.emit("before_agent_start");
+      t.emit("agent_start");
+      t.emit("agent_settled");
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(t.sendUserMessage).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("re-wakes once per window while the wake's prompt never reaches before_agent_start", async () => {
+      const t = setup();
+      t.emit("session_start");
+      t.delivery.deliver(details);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(2);
+
+      t.emit("before_agent_start");
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it("wakes after a run that never drained nextTurn settles", async () => {
+      const t = setup();
+      t.emit("session_start");
+      t.emit("input", { source: "interactive" });
       t.delivery.deliver(details);
       await flushMicrotasks();
+      expect(t.optionsOf()).toEqual([NEXT_TURN]);
+      expect(t.sendUserMessage).not.toHaveBeenCalled();
+
+      // Another extension starts a run directly (sendMessage with triggerTurn),
+      // which skips prompt() and before_agent_start, so nextTurn is not drained.
+      t.emit("agent_start");
+      t.emit("agent_settled");
+      await vi.advanceTimersByTimeAsync(0);
+
       expect(t.sendUserMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps an owed wake when the host is busy without a run at expiry", async () => {
+      const t = setup();
+      t.emit("session_start");
+      t.emit("input", { source: "interactive" });
+      t.delivery.deliver(details);
+      await flushMicrotasks();
+
+      // The input never starts a run and the host is compacting when the
+      // start window expires.
+      t.host.idle = false;
+      await vi.advanceTimersByTimeAsync(2_001);
+      expect(t.sendUserMessage).not.toHaveBeenCalled();
+
+      t.host.idle = true;
+      await vi.advanceTimersByTimeAsync(1_001);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops after three unconfirmed wakes and resumes once a prompt starts", async () => {
+      const t = setup();
+      t.emit("session_start");
+      t.delivery.deliver(details);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(10 * 31_000);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(3);
+
+      // A user prompt carries the stored notification and resets the count.
+      t.emit("before_agent_start");
+      t.emit("agent_start");
+      t.emit("agent_settled");
+      t.delivery.deliver(details);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(4);
+    });
+
+    it("keeps the notification stored and wakes again at expiry when sendUserMessage throws", async () => {
+      const t = setup();
+      t.emit("session_start");
+      t.sendUserMessage.mockImplementationOnce(() => {
+        throw new Error("Agent is already processing");
+      });
+
+      t.delivery.deliver(details);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(t.optionsOf()).toEqual([NEXT_TURN]);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(t.sendUserMessage).toHaveBeenCalledTimes(2);
     });
 
     it("ignores queued input that has a streamingBehavior", async () => {
@@ -309,6 +408,8 @@ describe("createTurnNotificationDelivery", () => {
       t.host.idle = true;
       await vi.advanceTimersByTimeAsync(1_000);
       expect(t.sendMessage).toHaveBeenCalledTimes(1);
+      // Only the wake retry timer is left; the held re-check stopped.
+      t.emit("before_agent_start");
       expect(vi.getTimerCount()).toBe(0);
     });
 
@@ -317,6 +418,8 @@ describe("createTurnNotificationDelivery", () => {
       t.emit("session_start");
       t.delivery.deliver(details);
       await flushMicrotasks();
+      // The prompt carrying the stored notification cancels the wake retry.
+      t.emit("before_agent_start");
       t.emit("session_compact");
 
       expect(vi.getTimerCount()).toBe(0);

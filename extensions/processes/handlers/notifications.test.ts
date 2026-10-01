@@ -1,3 +1,6 @@
+import type * as FsPromises from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import {
   type AgentSession,
@@ -188,6 +191,9 @@ type HostRequest = { systemPrompt?: string; messages: unknown[] };
  * appends PROBE_MARKER in `before_agent_start`, and an optional extension
  * registered after it (so its handlers run later in the same event).
  */
+// The root setup mocks node:fs with memfs; the real host needs the real one.
+const realFs = () => vi.importActual<typeof FsPromises>("node:fs/promises");
+
 async function createRealHost(
   registerLater?: (pi: ExtensionAPI) => void,
 ): Promise<{
@@ -196,6 +202,7 @@ async function createRealHost(
   runs: () => number;
   emitNotification: (payload: ProcessProtocolNotificationPayload) => void;
   settled: Promise<void>;
+  dispose: () => Promise<void>;
 }> {
   const faux = fauxProvider();
   const requests: HostRequest[] = [];
@@ -213,7 +220,8 @@ async function createRealHost(
     settle = resolve;
   });
   const cwd = process.cwd();
-  const agentDir = "/tmp/pi-processes-idle-wake-agent";
+  const fs = await realFs();
+  const agentDir = await fs.mkdtemp(join(tmpdir(), "pi-processes-idle-wake-"));
   const settingsManager = SettingsManager.inMemory();
   const resourceLoader = new DefaultResourceLoader({
     cwd,
@@ -262,6 +270,10 @@ async function createRealHost(
     runs: () => runs,
     emitNotification: (payload) => emitNotification(payload),
     settled,
+    dispose: async () => {
+      session.dispose();
+      await fs.rm(agentDir, { recursive: true, force: true });
+    },
   };
 }
 
@@ -282,7 +294,7 @@ describe("registerNotificationDelivery on a real Pi host", () => {
     expect(JSON.stringify(host.requests[0].messages)).toContain(
       "not written by the user",
     );
-    host.session.dispose();
+    await host.dispose();
   });
 
   it("joins the starting run when the notification arrives after before_agent_start drained nextTurn", async () => {
@@ -320,6 +332,6 @@ describe("registerNotificationDelivery on a real Pi host", () => {
     expect(JSON.stringify(last?.messages)).not.toContain(
       "not written by the user",
     );
-    host.session.dispose();
+    await host.dispose();
   });
 });

@@ -45,11 +45,11 @@ through `before_agent_start`, and Pi delivers `nextTurn` messages together with
 the next prompt, so the notification appears in the woken turn exactly once and
 the wake text does not repeat it.
 
-Why a starting prompt holds: `prompt()` drains the host's `nextTurn` list just
-before emitting `before_agent_start`, but the host only reports a run as active
-from `agent_start`. In between it still reads idle, so a notification stored as
-`nextTurn` there would miss the drain and wait for the next prompt with nothing
-to wake it. Between those two events `turn` notifications are held instead.
+Why a starting prompt holds: `prompt()` drains the host's `nextTurn` list right
+around `before_agent_start` (just before it up to Pi 0.86, just after it from
+0.87), but the host only reports a run as active from `agent_start`. In between
+it still reads idle, so a notification stored as `nextTurn` there can miss the
+drain and wait for the next prompt with nothing to wake it. Between those two events `turn` notifications are held instead.
 A user prompt seen at `input` is different: its `nextTurn` drain is still ahead,
 so notifications stored in that gap arrive with that prompt.
 
@@ -63,6 +63,21 @@ wake. While a wake is starting, no second one is sent. A prompt seen at
 `streamingBehavior` (2 s window) also counts as starting. A window never gets
 shorter, so the wake's own `input` event cannot shrink it, and it expires so a
 prompt that never starts a run cannot suppress wakes forever.
+
+A wake is owed from the moment a notification is stored as `nextTurn` until a
+prompt reaches `before_agent_start`; that prompt is the one that drains the list
+(in every Pi version only `prompt()` drains it, never a run started directly). If a
+wake is suppressed by an open start window (for example a user `input` that
+never starts a run, such as a slash command another extension handles), one
+timer re-runs it just after the window expires. A wake whose prompt never
+reaches `before_agent_start` is therefore repeated at most once per 30 s while
+the notification is still owed, never in a tight loop, and at most three times
+in a row: after that the notification stays stored and the next prompt carries
+it. The count resets at `before_agent_start`. If the host is busy without a run
+when the wake is due, it is re-checked every second, like held notifications,
+and a run that settles without draining `nextTurn` (one started directly by
+another extension) schedules the wake. The timer is cancelled at
+`before_agent_start`, `agent_start`, `session_start` and on dispose.
 
 Held notifications are flushed on the next tick after `session_compact`,
 `session_tree` and `agent_settled` (the host still reports busy inside those
