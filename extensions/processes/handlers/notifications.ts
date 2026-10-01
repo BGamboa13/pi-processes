@@ -4,6 +4,7 @@ import {
   CHANNELS,
   type ProcessProtocolNotificationPayload,
 } from "../../shared/protocol";
+import { createTurnNotificationDelivery } from "../idle-wake";
 import {
   attentionToSendOptions,
   sendProcessNotificationMessage,
@@ -19,7 +20,8 @@ const MAX_LOG_MATCH_NOTIFICATIONS_PER_WINDOW = 20;
  * converts each payload into a displayed `ad-process:notification` message with
  * the attention-derived send options. UI extensions observe the same channel
  * for display concerns (e.g. log-match highlighting) without importing this
- * module.
+ * module. `turn` notifications are routed by host state (see
+ * `createTurnNotificationDelivery`) instead of always steering.
  *
  * Returns a disposer that removes the listener; it must be called on
  * `session_shutdown` before the manager is killed.
@@ -28,6 +30,7 @@ export function registerNotificationDelivery(
   events: EventBus,
   pi: ExtensionAPI,
 ): () => void {
+  const turnDelivery = createTurnNotificationDelivery(pi);
   let windowStart: number | null = null;
   let sentInWindow = 0;
   let suppressed = 0;
@@ -102,6 +105,11 @@ export function registerNotificationDelivery(
         sentInWindow++;
       }
 
+      if (payload.attention === "turn") {
+        turnDelivery.deliver(payload);
+        return;
+      }
+
       const options = attentionToSendOptions(payload.attention);
       sendProcessNotificationMessage(pi, payload, options);
     },
@@ -109,6 +117,7 @@ export function registerNotificationDelivery(
 
   return () => {
     disposeListener();
+    turnDelivery.dispose();
     resetWindow();
   };
 }

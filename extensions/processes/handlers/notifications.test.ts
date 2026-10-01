@@ -1,4 +1,14 @@
-import { createEventBus } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import {
+  type AgentSession,
+  createAgentSession,
+  createEventBus,
+  DefaultResourceLoader,
+  type ExtensionAPI,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import type { ProcessProtocolNotificationPayload } from "../../shared/protocol";
 import { CHANNELS } from "../../shared/protocol";
@@ -25,7 +35,28 @@ function makePayload(
 }
 
 function piWithSendMessage(sendMessage: ReturnType<typeof vi.fn>) {
-  return { sendMessage } as never;
+  return { sendMessage, sendUserMessage: vi.fn(), on: vi.fn() } as never;
+}
+
+/** A fake pi whose lifecycle handlers can be fired with a fake context. */
+function hostedPi(idle: boolean) {
+  const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
+  const sendMessage = vi.fn();
+  const sendUserMessage = vi.fn();
+  const pi = {
+    sendMessage,
+    sendUserMessage,
+    on: (event: string, handler: (event: unknown, ctx: unknown) => void) =>
+      handlers.set(event, handler),
+  } as never;
+  const startSession = () =>
+    handlers.get("session_start")?.(
+      { type: "session_start" },
+      {
+        isIdle: () => idle,
+      },
+    );
+  return { pi, sendMessage, sendUserMessage, startSession };
 }
 
 describe("registerNotificationDelivery", () => {
@@ -44,6 +75,46 @@ describe("registerNotificationDelivery", () => {
     expect(options.triggerTurn).toBe(true);
     expect(options.deliverAs).toBe("steer");
   });
+
+  // Regression: idle `turn` notifications woke the agent without before_agent_start (#121).
+  it("routes a turn notification to nextTurn plus one prompt wake on an idle host", async () => {
+    const events = createEventBus();
+    const host = hostedPi(true);
+    registerNotificationDelivery(events, host.pi);
+    host.startSession();
+
+    events.emit(CHANNELS.NOTIFICATION, makePayload({ attention: "turn" }));
+    events.emit(
+      CHANNELS.NOTIFICATION,
+      makePayload({ attention: "turn", processId: "proc_2" }),
+    );
+    await Promise.resolve();
+
+    expect(host.sendMessage).toHaveBeenCalledTimes(2);
+    for (const [, options] of host.sendMessage.mock.calls) {
+      expect(options).toEqual({ triggerTurn: false, deliverAs: "nextTurn" });
+    }
+    expect(host.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["context", "ignore"] as const)(
+    "keeps %s attention as nextTurn without waking an idle host",
+    async (attention) => {
+      const events = createEventBus();
+      const host = hostedPi(true);
+      registerNotificationDelivery(events, host.pi);
+      host.startSession();
+
+      events.emit(CHANNELS.NOTIFICATION, makePayload({ attention }));
+      await Promise.resolve();
+
+      expect(host.sendMessage.mock.calls[0][1]).toEqual({
+        triggerTurn: false,
+        deliverAs: "nextTurn",
+      });
+      expect(host.sendUserMessage).not.toHaveBeenCalled();
+    },
+  );
 
   it("maps context attention to a non-turn nextTurn message", () => {
     const events = createEventBus();
@@ -107,5 +178,148 @@ describe("registerNotificationDelivery", () => {
 
     dispose();
     vi.useRealTimers();
+  });
+});
+
+type HostRequest = { systemPrompt?: string; messages: unknown[] };
+
+/**
+ * A real AgentSession with pi-processes delivery registered, a probe that
+ * appends PROBE_MARKER in `before_agent_start`, and an optional extension
+ * registered after it (so its handlers run later in the same event).
+ */
+async function createRealHost(
+  registerLater?: (pi: ExtensionAPI) => void,
+): Promise<{
+  session: AgentSession;
+  requests: HostRequest[];
+  runs: () => number;
+  emitNotification: (payload: ProcessProtocolNotificationPayload) => void;
+  settled: Promise<void>;
+}> {
+  const faux = fauxProvider();
+  const requests: HostRequest[] = [];
+  faux.setResponses(
+    Array.from({ length: 4 }, () => (context: HostRequest) => {
+      requests.push(context);
+      return fauxAssistantMessage("noted");
+    }),
+  );
+
+  let emitNotification = (_payload: ProcessProtocolNotificationPayload) => {};
+  let runs = 0;
+  let settle = () => {};
+  const settled = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  const cwd = process.cwd();
+  const agentDir = "/tmp/pi-processes-idle-wake-agent";
+  const settingsManager = SettingsManager.inMemory();
+  const resourceLoader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    settingsManager,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    extensionFactories: [
+      (pi) => {
+        pi.registerProvider(faux.provider);
+        pi.on("agent_start", () => {
+          runs++;
+        });
+        pi.on("agent_settled", () => settle());
+        registerNotificationDelivery(pi.events, pi);
+        emitNotification = (payload) =>
+          pi.events.emit(CHANNELS.NOTIFICATION, payload);
+        // Stands in for any extension that shapes the system prompt.
+        pi.on("before_agent_start", (event) => ({
+          systemPrompt: `${event.systemPrompt}\nPROBE_MARKER`,
+        }));
+        registerLater?.(pi);
+      },
+    ],
+  });
+  await resourceLoader.reload();
+  const { session } = await createAgentSession({
+    cwd,
+    agentDir,
+    modelRuntime: await ModelRuntime.create({
+      authPath: `${agentDir}/auth.json`,
+      modelsPath: null,
+    }),
+    model: faux.getModel(),
+    resourceLoader,
+    sessionManager: SessionManager.inMemory(cwd),
+    settingsManager,
+    noTools: "all",
+  });
+  await session.bindExtensions({});
+  return {
+    session,
+    requests,
+    runs: () => runs,
+    emitNotification: (payload) => emitNotification(payload),
+    settled,
+  };
+}
+
+const countProcessEvents = (messages: unknown[]) =>
+  JSON.stringify(messages).match(/process_id=/g)?.length ?? 0;
+
+// Regression: idle `turn` notifications woke the agent without before_agent_start (#121).
+describe("registerNotificationDelivery on a real Pi host", () => {
+  it("wakes an idle host through a prompt so before_agent_start still runs", async () => {
+    const host = await createRealHost();
+
+    host.emitNotification(makePayload({ attention: "turn" }));
+    await host.settled;
+
+    expect(host.requests).toHaveLength(1);
+    expect(host.requests[0].systemPrompt).toContain("PROBE_MARKER");
+    expect(countProcessEvents(host.requests[0].messages)).toBe(1);
+    expect(JSON.stringify(host.requests[0].messages)).toContain(
+      "not written by the user",
+    );
+    host.session.dispose();
+  });
+
+  it("joins the starting run when the notification arrives after before_agent_start drained nextTurn", async () => {
+    let parked: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      parked = resolve;
+    });
+    let reachedBarrier: () => void = () => {};
+    const atBarrier = new Promise<void>((resolve) => {
+      reachedBarrier = resolve;
+    });
+    const host = await createRealHost((pi) => {
+      pi.on("before_agent_start", async () => {
+        reachedBarrier();
+        await gate;
+      });
+    });
+
+    const prompt = host.session.prompt("user prompt");
+    await atBarrier;
+    host.emitNotification(makePayload({ attention: "turn" }));
+    parked();
+    await prompt;
+    await host.settled;
+    // Let any stray wake start its run before asserting there is none.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(host.runs(), "exactly one run, no extra wake run").toBe(1);
+    const last = host.requests.at(-1);
+    expect(last?.systemPrompt).toContain("PROBE_MARKER");
+    expect(
+      countProcessEvents(last?.messages ?? []),
+      "the notification joins the starting run exactly once",
+    ).toBe(1);
+    expect(JSON.stringify(last?.messages)).not.toContain(
+      "not written by the user",
+    );
+    host.session.dispose();
   });
 });
