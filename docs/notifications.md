@@ -22,10 +22,60 @@ do not affect delivery.
 
 ### Delivery timing
 
-`turn` notifications use Pi's `steer` path. They wake an idle agent or reach an
-active run after its current tool calls finish. `context` and emitted `ignore`
-notifications use `nextTurn`: they do not wake or steer the agent and enter the
-conversation with the next user prompt.
+`turn` notifications are routed by what the Pi host is doing
+(`createTurnNotificationDelivery` in `extensions/processes/idle-wake.ts`, called
+from `registerNotificationDelivery`). The state comes from the latest extension
+context, tracked from `session_start`, `input`, `before_agent_start`,
+`agent_start`, `turn_end`, `agent_end`, `agent_settled`, `session_compact` and
+`session_tree`.
+
+| Host state                                                                        | Delivery                                                                                                                                               |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Run active (`agent_start` .. `agent_settled`)                                     | `sendMessage` with `{ triggerTurn: true, deliverAs: "steer" }`: the notification reaches the run after its current tool calls finish.                  |
+| Idle                                                                              | `sendMessage` with `{ triggerTurn: false, deliverAs: "nextTurn" }`, then one `sendUserMessage` wake that says it is an automated process notification. |
+| Busy without a run (manual or threshold compaction, `/tree` branch summarization) | Held in memory, then routed as above once the host is idle or running.                                                                                 |
+| Prompt starting (after `before_agent_start`, before `agent_start`)                | Held, then sent with the steer options at `agent_start` so it joins that run. If no run starts within 30 s, it takes the idle path.                    |
+| No usable context (none seen yet, or stale after a session replacement)           | The original `sendMessage` call with the steer options, so a notification is never stranded.                                                           |
+
+Why the idle path does not use `triggerTurn: true`: Pi's `sendCustomMessage`
+starts a run directly when the host is not streaming, which skips
+`before_agent_start` (earendil-works/pi#5581). The woken turn would then lack
+every system-prompt addition other extensions make in that hook. A prompt goes
+through `before_agent_start`, and Pi delivers `nextTurn` messages together with
+the next prompt, so the notification appears in the woken turn exactly once and
+the wake text does not repeat it.
+
+Why a starting prompt holds: `prompt()` drains the host's `nextTurn` list just
+before emitting `before_agent_start`, but the host only reports a run as active
+from `agent_start`. In between it still reads idle, so a notification stored as
+`nextTurn` there would miss the drain and wait for the next prompt with nothing
+to wake it. Between those two events `turn` notifications are held instead.
+A user prompt seen at `input` is different: its `nextTurn` drain is still ahead,
+so notifications stored in that gap arrive with that prompt.
+
+The direct start that `triggerTurn: true` performs would also begin a run in the
+middle of a compaction or branch summarization, which is why those states hold
+too.
+
+Wake coalescing: notifications delivered in the same synchronous pass share one
+wake. While a wake is starting, no second one is sent. A prompt seen at
+`before_agent_start` (30 s window) or a user prompt seen at `input` without a
+`streamingBehavior` (2 s window) also counts as starting. A window never gets
+shorter, so the wake's own `input` event cannot shrink it, and it expires so a
+prompt that never starts a run cannot suppress wakes forever.
+
+Held notifications are flushed on the next tick after `session_compact`,
+`session_tree` and `agent_settled` (the host still reports busy inside those
+handlers). While anything is held, a 1 s re-check also runs, so a cancelled
+operation that emits no event cannot strand it; the re-check is not armed when
+nothing is held. Held notifications are dropped on `session_start`, because they
+belong to the previous session.
+
+Pi version notes: `agent_settled` exists from Pi 0.80.4. On Pi 0.80.3 the end of
+a run is never seen, so every `turn` notification is steered as before (the
+previous behavior, including its idle-wake limitation). There is no
+`session_compact_failed` event in the Pi versions this package is tested
+against, so a failed or cancelled compaction is covered by the 1 s re-check.
 
 Deferring non-turn notifications also preserves tool-call ordering. Appending a
 custom message during tool execution would place it between the assistant
@@ -62,11 +112,11 @@ execution, output retention, and UI — none of it changes attention or delivery
 An attention level is resolved per event and mapped to Pi send options by
 `attentionToSendOptions` (`extensions/processes/notification-sender.ts`):
 
-| Attention | `triggerTurn` | `deliverAs` | Agent effect |
-| --------- | ------------- | ----------- | ------------ |
-| `turn` | `true` | `steer` | Wakes an idle agent or steers an active run after its current tool calls. |
-| `context` | `false` | `nextTurn` | Waits for the next user prompt; does not wake or steer the agent. |
-| `ignore` | `false` | `nextTurn` | Suppressed for successful exits and external kills; emitted log matches wait for the next user prompt. Failures are promoted to `context`. |
+| Attention | `triggerTurn` | `deliverAs` | Agent effect                                                                                                                                            |
+| --------- | ------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `turn`    | `true`        | `steer`     | Steers an active run after its current tool calls. On an idle host it is stored as `nextTurn` and woken through a prompt instead (see Delivery timing). |
+| `context` | `false`       | `nextTurn`  | Waits for the next user prompt; does not wake or steer the agent.                                                                                       |
+| `ignore`  | `false`       | `nextTurn`  | Suppressed for successful exits and external kills; emitted log matches wait for the next user prompt. Failures are promoted to `context`.              |
 
 Every delivered message has `display: true` and is persisted when Pi adds it to
 the conversation. A `nextTurn` message is not displayed or persisted until the
