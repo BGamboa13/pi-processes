@@ -187,6 +187,35 @@ describe("registerNotificationDelivery", () => {
 type HostRequest = { systemPrompt?: string; messages: unknown[] };
 
 /**
+ * The request a provider received. Pi up to 0.99 passes the system prompt as
+ * `context.systemPrompt`; Pi 1.0 carries it as leading `role: "system"`
+ * messages in the transcript. Both are read so the test runs on either.
+ */
+function toHostRequest(context: {
+  systemPrompt?: string;
+  messages: unknown[];
+}): HostRequest {
+  const system: string[] = [];
+  const messages: unknown[] = [];
+  for (const message of context.messages) {
+    const m = message as { role?: string; content?: unknown };
+    if (m.role !== "system") {
+      messages.push(message);
+      continue;
+    }
+    const content = Array.isArray(m.content) ? m.content : [m.content];
+    for (const part of content) {
+      if (typeof part === "string") system.push(part);
+      else if (part && typeof (part as { text?: unknown }).text === "string")
+        system.push((part as { text: string }).text);
+    }
+  }
+  const systemPrompt =
+    context.systemPrompt ?? (system.length > 0 ? system.join("\n") : undefined);
+  return { systemPrompt, messages };
+}
+
+/**
  * A real AgentSession with pi-processes delivery registered, a probe that
  * appends PROBE_MARKER in `before_agent_start`, and an optional extension
  * registered after it (so its handlers run later in the same event).
@@ -208,7 +237,7 @@ async function createRealHost(
   const requests: HostRequest[] = [];
   faux.setResponses(
     Array.from({ length: 4 }, () => (context: HostRequest) => {
-      requests.push(context);
+      requests.push(toHostRequest(context));
       return fauxAssistantMessage("noted");
     }),
   );
@@ -289,7 +318,10 @@ describe("registerNotificationDelivery on a real Pi host", () => {
     await host.settled;
 
     expect(host.requests).toHaveLength(1);
-    expect(host.requests[0].systemPrompt).toContain("PROBE_MARKER");
+    expect(
+      host.requests[0].systemPrompt ?? "",
+      "the woken request carries what before_agent_start added",
+    ).toContain("PROBE_MARKER");
     expect(countProcessEvents(host.requests[0].messages)).toBe(1);
     expect(JSON.stringify(host.requests[0].messages)).toContain(
       "not written by the user",
@@ -324,7 +356,10 @@ describe("registerNotificationDelivery on a real Pi host", () => {
 
     expect(host.runs(), "exactly one run, no extra wake run").toBe(1);
     const last = host.requests.at(-1);
-    expect(last?.systemPrompt).toContain("PROBE_MARKER");
+    expect(
+      last?.systemPrompt ?? "",
+      "the run carries what before_agent_start added",
+    ).toContain("PROBE_MARKER");
     expect(
       countProcessEvents(last?.messages ?? []),
       "the notification joins the starting run exactly once",
